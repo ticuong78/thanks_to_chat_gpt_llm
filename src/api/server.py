@@ -2,13 +2,15 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 from time import perf_counter
 
-from ..argument.arguments import db
-from ..argument.constants import QUERYING
+from ..app.vectorstore.chroma_store import VectorStoreManager
+from ..app.config import GENERATION_MODEL
 from ..singletons import ollama_client
 
 
 app = Flask(__name__)
 CORS(app)
+manager = VectorStoreManager()
+db = manager.open()
 
 
 def _format_sources(hits):
@@ -120,7 +122,7 @@ def query():
     sys, user = _prompt_for_style(style, language, q, context)
 
     resp = ollama_client.chat(
-      model=QUERYING,
+      model=GENERATION_MODEL,
       messages=[{"role": "system", "content": sys}, {"role": "user", "content": user}],
       options={"temperature": 0.2},
     )
@@ -145,4 +147,3 @@ def create_app():
 
 if __name__ == "__main__":
   app.run(host="0.0.0.0", port=8000, debug=False)
-
