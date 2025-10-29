@@ -1,6 +1,7 @@
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from time import perf_counter
+import json
 
 from ..app.vectorstore.chroma_store import VectorStoreManager
 from ..app.config import GENERATION_MODEL
@@ -72,6 +73,69 @@ def _prompt_for_style(style: str, language: str, query: str, context: str):
   return sys, user
 
 
+def _translate_to_english(text: str) -> str:
+  try:
+    prompt = (
+      "Translate to concise English suitable for search. "
+      "Return only the translation without explanations.\n\nText:" + text
+    )
+    r = ollama_client.chat(model=GENERATION_MODEL, messages=[{"role": "user", "content": prompt}], options={"temperature": 0.0})
+    return r.get("message", {}).get("content", "").strip()
+  except Exception:
+    return text
+
+
+def _similarity_with_threshold(db, q: str, k: int, threshold):
+  hits = db.similarity_search_with_score(q, k=k)
+  if threshold is None:
+    return hits
+  try:
+    thr = float(threshold)
+    filtered = [(d, s) for (d, s) in hits if s <= thr]
+    return filtered if filtered else hits
+  except Exception:
+    return hits
+
+
+def _retrieve_flexible(db, q: str, k: int, threshold, language: str, mmr: bool, fetch_k: int):
+  # 1) Primary similarity
+  hits = _similarity_with_threshold(db, q, k, threshold)
+  if hits:
+    return hits, {"strategy": "similarity", "query": q}
+
+  # 2) Try MMR
+  try:
+    docs = db.max_marginal_relevance_search(q, k=max(k, 8), fetch_k=max(fetch_k, k * 3))
+    hits = [(d, 0.0) for d in docs]
+    if hits:
+      return hits, {"strategy": "mmr", "query": q}
+  except Exception:
+    pass
+
+  # 3) Translate VI -> EN and retry
+  used_translation = None
+  if language.lower().startswith("vi"):
+    tq = _translate_to_english(q)
+    used_translation = tq
+    hits = _similarity_with_threshold(db, tq, max(k, 10), None)
+    if hits:
+      return hits, {"strategy": "similarity_translated", "query": tq, "translated": True}
+    try:
+      docs = db.max_marginal_relevance_search(tq, k=max(k, 10), fetch_k=max(fetch_k, 24))
+      hits = [(d, 0.0) for d in docs]
+      if hits:
+        return hits, {"strategy": "mmr_translated", "query": tq, "translated": True}
+    except Exception:
+      pass
+
+  # 4) Last resort: increase k and drop threshold
+  hits = _similarity_with_threshold(db, q, max(k, 12), None)
+  if hits:
+    return hits, {"strategy": "similarity_wide", "query": q}
+
+  return [], {"strategy": "none", "query": q}
+
+
 @app.get("/health")
 def health():
   try:
@@ -97,24 +161,15 @@ def query():
     return jsonify({"error": "Missing 'query' in JSON body"}), 400
 
   try:
-    if mmr:
-      docs = db.max_marginal_relevance_search(q, k=k, fetch_k=fetch_k)
-      hits = [(d, 0.0) for d in docs]
-    else:
-      hits = db.similarity_search_with_score(q, k=k)
-
-    if threshold is not None and not mmr:
-      try:
-        thr = float(threshold)
-        hits = [(d, s) for (d, s) in hits if s <= thr]
-      except Exception:
-        pass
+    # Flexible retrieval pipeline (with fallbacks)
+    hits, meta = _retrieve_flexible(db, q, k, threshold, language, mmr, fetch_k)
 
     if not hits:
       return jsonify({
         "query": q,
         "answer": "Tôi không chắc từ dữ liệu đã lập chỉ mục." if language.startswith("vi") else "I am not sure from the indexed data.",
         "sources": [],
+        "retrieval": meta,
         "latency_ms": int((perf_counter() - t0) * 1000),
       }), 200
 
@@ -133,6 +188,7 @@ def query():
       "answer": answer,
       "sources": _format_sources(hits),
       "used_prompt": {"system": sys, "user": user},
+      "retrieval": meta,
       "mmr": mmr,
       "k": k,
       "latency_ms": int((perf_counter() - t0) * 1000),
